@@ -1,0 +1,9 @@
+{
+  "builds": [
+    { "src": "vite.config.ts", "use": "@vercel/node" }
+  ],
+  "routes": [
+    { "src": "/manifest.json", "dest": "/public/manifest.json" },
+    { "src": "/sw.js", "dest": "/public/sw.js" }
+  ]
+}
