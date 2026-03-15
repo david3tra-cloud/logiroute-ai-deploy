@@ -1,6 +1,40 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import { Delivery } from "../types";
 
+// ========= Helpers de errores =========
+type ErrorWithMessage = {
+  message: string;
+};
+
+function isErrorWithMessage(error: unknown): error is ErrorWithMessage {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof (error as Record<string, unknown>).message === "string"
+  );
+}
+
+function toErrorWithMessage(maybeError: unknown): ErrorWithMessage {
+  if (isErrorWithMessage(maybeError)) return maybeError;
+
+  try {
+    return new Error(JSON.stringify(maybeError));
+  } catch {
+    return new Error(String(maybeError));
+  }
+}
+
+function getErrorMessage(error: unknown): string {
+  return toErrorWithMessage(error).message;
+}
+
+// DEBUG: mostrar el error en móvil de forma explícita
+function debugAlert(message: string) {
+  // Cuando acabemos de depurar, puedes comentar este alert
+  alert(`DEBUG ERROR:\n${message}`);
+}
+
 // Persistent cache in localStorage to avoid re-searching the same locations across sessions
 const CACHE_STORAGE_KEY = 'logiroute_address_cache_v1';
 const getInitialCache = (): Record<string, any> => {
@@ -8,6 +42,7 @@ const getInitialCache = (): Record<string, any> => {
     const saved = localStorage.getItem(CACHE_STORAGE_KEY);
     return saved ? JSON.parse(saved) : {};
   } catch (e) {
+    console.warn("Failed to read address cache", e);
     return {};
   }
 };
@@ -76,17 +111,20 @@ async function withRetry<T>(
   onRetry?: (msg: string) => void,
   maxRetries = 3
 ): Promise<T> {
-  let lastError: any;
+  let lastError: unknown;
   for (let i = 0; i < maxRetries; i++) {
     try {
       return await fn();
-    } catch (error: any) {
+    } catch (error: unknown) {
       lastError = error;
-      const isQuotaError = error?.message?.includes("429") || error?.status === 429 || error?.message?.includes("RESOURCE_EXHAUSTED");
-      
+      const message = getErrorMessage(error);
+      const isQuotaError =
+        message.includes("429") ||
+        message.includes("RESOURCE_EXHAUSTED");
+
       if (isQuotaError && i < maxRetries - 1) {
         const waitTime = Math.pow(2, i) * 2000;
-        if (onRetry) onRetry(`Límite (429). Reintentando en ${waitTime/1000}s...`);
+        if (onRetry) onRetry(`Límite (429). Reintentando en ${waitTime / 1000}s...`);
         await sleep(waitTime);
         continue;
       }
@@ -197,236 +235,306 @@ export const parseAddress = async (
   const rawManual = manualCoords?.trim() || "";
   const cacheKey = `${rawInput}|${rawManual}`.toLowerCase();
   
-  // 1. Check persistent cache first
-  if (addressCache[cacheKey]) {
-    return addressCache[cacheKey];
-  }
+  try {
+    // 1. Check persistent cache first
+    if (addressCache[cacheKey]) {
+      return addressCache[cacheKey];
+    }
 
-  // 2. Local check for coordinates (No API call needed)
-  const directCoords = extractCoords(rawManual || rawInput);
-  if (directCoords && !isPlusCode(rawManual || rawInput)) {
-    const isCoordinateOnly = !rawInput || extractCoords(rawInput);
-    const result = {
-      recipient: isCoordinateOnly ? "Punto GPS" : rawInput,
-      address: isCoordinateOnly ? `Ubicación: ${directCoords.lat}, ${directCoords.lng}` : rawInput,
-      lat: directCoords.lat,
-      lng: directCoords.lng,
-      sourceUrl: isUrl(rawManual) ? rawManual : `https://www.google.com/maps/dir/?api=1&destination=${directCoords.lat},${directCoords.lng}`
-    };
+    // 2. Local check for coordinates (No API call needed)
+    const directCoords = extractCoords(rawManual || rawInput);
+    if (directCoords && !isPlusCode(rawManual || rawInput)) {
+      const isCoordinateOnly = !rawInput || extractCoords(rawInput);
+      const result = {
+        recipient: isCoordinateOnly ? "Punto GPS" : rawInput,
+        address: isCoordinateOnly ? `Ubicación: ${directCoords.lat}, ${directCoords.lng}` : rawInput,
+        lat: directCoords.lat,
+        lng: directCoords.lng,
+        sourceUrl: isUrl(rawManual)
+          ? rawManual
+          : `https://www.google.com/maps/dir/?api=1&destination=${directCoords.lat},${directCoords.lng}`
+      };
+      addressCache[cacheKey] = result;
+      saveCache();
+      return result;
+    }
+
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || "").trim();
+    if (!apiKey || apiKey === "undefined" || apiKey === "null" || apiKey.length < 10) {
+      throw new Error(
+        "Error de Configuración: La clave de API no es válida o está vacía. Por favor, usa el botón 'REPARAR APP' en el panel de CONTROL."
+      );
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const anchor = userLocation || { latitude: 38.2622, longitude: -0.6993 };
+
+    const result = await withRetry(async () => {
+      const prompt = `
+        LOCALIZA EL PUNTO EXACTO EN GOOGLE MAPS PARA: "${rawManual || rawInput}".
+        IMPORTANTE: Si es una empresa, busca su ubicación ACTUAL (2024-2025). No uses direcciones antiguas si se ha mudado.
+        
+        RESPONDE CON ESTE FORMATO:
+        NOMBRE: [Nombre oficial]
+        DIRECCION: [Dirección completa]
+        COORDENADAS: [latitud], [longitud]
+        URL: [Enlace de Google Maps]
+      `;
+
+      let response: any;
+      try {
+        // Usamos gemini-2.5-flash con googleMaps para máxima precisión en lugares
+        response = await ai.models.generateContent({
+          model: "gemini-2.5-flash",
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          config: {
+            tools: [{ googleMaps: {} }, { googleSearch: {} }],
+            toolConfig: {
+              retrievalConfig: {
+                latLng: {
+                  latitude: anchor.latitude,
+                  longitude: anchor.longitude
+                }
+              }
+            },
+            temperature: 0.1
+          },
+        });
+      } catch (e: unknown) {
+        console.warn("Error con Google Maps tool, usando fallback search:", e);
+        try {
+          response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            config: {
+              tools: [{ googleSearch: {} }],
+              temperature: 0,
+            },
+          });
+        } catch (fallbackErr: unknown) {
+          console.warn("Error en búsqueda principal:", fallbackErr);
+          // Fallback simplificado si falla todo lo anterior
+          response = await ai.models.generateContent({
+            model: "gemini-3.5-flash",
+            contents: [{
+              role: "user",
+              parts: [{
+                text: `Localiza las coordenadas GPS y dirección de: "${rawManual || rawInput}" en Elche.
+Responde solo JSON con este esquema:
+{"lat": 0, "lng": 0, "address": "", "recipient": ""}`
+              }]
+            }],
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  lat: { type: Type.NUMBER },
+                  lng: { type: Type.NUMBER },
+                  address: { type: Type.STRING },
+                  recipient: { type: Type.STRING }
+                },
+                required: ["lat", "lng", "address", "recipient"]
+              }
+            }
+          });
+          const textJson = response.text;
+          let data: any;
+          try {
+            data = JSON.parse(textJson);
+          } catch (jsonErr: unknown) {
+            console.error("Error parseando JSON del fallback:", textJson, jsonErr);
+            throw new Error("No se pudo interpretar la respuesta de coordenadas.");
+          }
+
+          if (
+            data.lat === undefined ||
+            data.lng === undefined ||
+            isNaN(data.lat) ||
+            isNaN(data.lng)
+          ) {
+            throw new Error("No se encontraron coordenadas válidas.");
+          }
+          
+          return {
+            recipient: data.recipient || rawInput,
+            address: data.address || rawInput,
+            lat: data.lat,
+            lng: data.lng,
+            sourceUrl: `https://www.google.com/maps/search/?api=1&query=${data.lat},${data.lng}`
+          };
+        }
+      }
+
+      const text: string = response.text || "";
+      const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
+      const chunks = groundingMetadata?.groundingChunks as any[] | undefined;
+      
+      let lat: number | null = null;
+      let lng: number | null = null;
+      let title = "";
+      let url = "";
+
+      // 1. Intentar extraer de los metadatos de búsqueda (Grounding)
+      if (chunks && chunks.length > 0) {
+        for (const c of chunks) {
+          if (c.web?.uri) {
+            const cData = extractCoords(c.web.uri);
+            if (cData) {
+              lat = cData.lat;
+              lng = cData.lng;
+              url = c.web.uri;
+              title = c.web.title || title;
+              break; 
+            }
+          }
+        }
+      }
+
+      // 2. Si no hay en metadatos, extraer del texto de la respuesta
+      if (lat === null || lng === null) {
+        const coordsFromText = extractCoords(text);
+        if (coordsFromText) {
+          lat = coordsFromText.lat;
+          lng = coordsFromText.lng;
+        }
+      }
+
+      // 3. Extraer URL del texto si no la tenemos
+      if (!url) {
+        const urlMatch = text.match(/https?:\/\/(?:www\.)?(?:google\.com\/maps|maps\.app\.goo\.gl)\/[^\s]+/i);
+        if (urlMatch) url = urlMatch[0];
+      }
+
+      if (lat === null || lng === null || isNaN(lat) || isNaN(lng)) {
+        throw new Error(
+          `No se pudo localizar con precisión "${rawInput}". Por favor, introduce una dirección más específica o coordenadas.`
+        );
+      }
+
+      const lines = text
+        .split('\n')
+        .map(l => l.trim())
+        .filter(l => l.length > 0);
+      
+      const cleanLine = (line: string, prefix: string) =>
+        line.replace(new RegExp(`^${prefix}:?\\s*`, 'i'), '').trim();
+      
+      let finalRecipient = rawInput;
+      let finalAddress = rawInput;
+
+      lines.forEach(line => {
+        if (line.toUpperCase().startsWith('NOMBRE')) finalRecipient = cleanLine(line, 'NOMBRE');
+        if (line.toUpperCase().startsWith('DIRECCION')) finalAddress = cleanLine(line, 'DIRECCION');
+      });
+
+      return {
+        recipient: title || finalRecipient,
+        address: finalAddress,
+        lat,
+        lng,
+        sourceUrl: url || `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`,
+        phone: text.match(/(?:\+34|34)?[6789]\d{8}/)?.[0]
+      };
+    }, onRetry);
+
     addressCache[cacheKey] = result;
     saveCache();
     return result;
-  }
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
 
-  const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || "").trim();
-  if (!apiKey || apiKey === "undefined" || apiKey === "null" || apiKey.length < 10) {
-    throw new Error("Error de Configuración: La clave de API no es válida o está vacía. Por favor, usa el botón 'REPARAR APP' en el panel de CONTROL.");
-  }
-
-  const ai = new GoogleGenAI({ apiKey });
-  const anchor = userLocation || { latitude: 38.2622, longitude: -0.6993 };
-
-  const result = await withRetry(async () => {
-    const prompt = `
-      LOCALIZA EL PUNTO EXACTO EN GOOGLE MAPS PARA: "${rawManual || rawInput}".
-      IMPORTANTE: Si es una empresa, busca su ubicación ACTUAL (2024-2025). No uses direcciones antiguas si se ha mudado.
-      
-      RESPONDE CON ESTE FORMATO:
-      NOMBRE: [Nombre oficial]
-      DIRECCION: [Dirección completa]
-      COORDENADAS: [latitud], [longitud]
-      URL: [Enlace de Google Maps]
-    `;
-
-    let response: any;
     try {
-      // Usamos gemini-2.5-flash con googleMaps para máxima precisión en lugares
-      response = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        config: {
-          tools: [{ googleMaps: {} }, { googleSearch: {} }],
-          toolConfig: {
-            retrievalConfig: {
-              latLng: {
-                latitude: anchor.latitude,
-                longitude: anchor.longitude
-              }
-            }
-          },
-          temperature: 0.1
-        },
-      });
-    } catch (e: any) {
-      console.warn("Error con Google Maps tool, usando fallback search:", e);
-      try {
-        response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: [{ role: "user", parts: [{ text: prompt }] }],
-          config: {
-            tools: [{ googleSearch: {} }],
-            temperature: 0,
-          },
-        });
-      } catch (fallbackErr) {
-        console.warn("Error en búsqueda principal:", fallbackErr);
-        // Fallback simplificado si falla todo lo anterior
-        response = await ai.models.generateContent({
-          model: "gemini-3.5-flash",
-          contents: [{
-            role: "user",
-            parts: [{
-              text: `Localiza las coordenadas GPS y dirección de: "${rawManual || rawInput}" en Elche.
-Responde solo JSON con este esquema:
-{"lat": 0, "lng": 0, "address": "", "recipient": ""}`
-            }]
-          }],
-          config: {
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                lat: { type: Type.NUMBER },
-                lng: { type: Type.NUMBER },
-                address: { type: Type.STRING },
-                recipient: { type: Type.STRING }
-              },
-              required: ["lat", "lng", "address", "recipient"]
-            }
-          }
-        });
-        const data = JSON.parse(response.text);
-        if (data.lat === undefined || data.lng === undefined || isNaN(data.lat) || isNaN(data.lng)) {
-          throw new Error("No se encontraron coordenadas válidas.");
-        }
-        
-        return {
-          recipient: data.recipient || rawInput,
-          address: data.address || rawInput,
-          lat: data.lat,
-          lng: data.lng,
-          sourceUrl: `https://www.google.com/maps/search/?api=1&query=${data.lat},${data.lng}`
-        };
-      }
+      console.error("Error parseAddress (detallado):", JSON.stringify(error, null, 2));
+    } catch {
+      console.error("Error parseAddress (string):", String(error));
     }
 
-    const text: string = response.text || "";
-    const groundingMetadata = response.candidates?.[0]?.groundingMetadata;
-    const chunks = groundingMetadata?.groundingChunks as any[] | undefined;
-    
-    let lat: number | null = null;
-    let lng: number | null = null;
-    let title = "";
-    let url = "";
+    // DEBUG: ver error en móvil
+    debugAlert(message);
 
-    // 1. Intentar extraer de los metadatos de búsqueda (Grounding)
-    if (chunks && chunks.length > 0) {
-      for (const c of chunks) {
-        if (c.web?.uri) {
-          const cData = extractCoords(c.web.uri);
-          if (cData) {
-            lat = cData.lat;
-            lng = cData.lng;
-            url = c.web.uri;
-            title = c.web.title || title;
-            break; 
-          }
-        }
-      }
-    }
+    // Si quieres mantener el mensaje "bonito", puedes dejar también este alert,
+    // o comentarlo mientras estamos depurando.
+    // alert(`❌ Error al buscar la dirección:\n${message}\n\nInténtalo de nuevo o comprueba tu conexión.`);
 
-    // 2. Si no hay en metadatos, extraer del texto de la respuesta
-    if (lat === null || lng === null) {
-      const coordsFromText = extractCoords(text);
-      if (coordsFromText) {
-        lat = coordsFromText.lat;
-        lng = coordsFromText.lng;
-      }
-    }
-
-    // 3. Extraer URL del texto si no la tenemos
-    if (!url) {
-      const urlMatch = text.match(/https?:\/\/(?:www\.)?(?:google\.com\/maps|maps\.app\.goo\.gl)\/[^\s]+/i);
-      if (urlMatch) url = urlMatch[0];
-    }
-
-    if (lat === null || lng === null || isNaN(lat) || isNaN(lng)) {
-      throw new Error(`No se pudo localizar con precisión "${rawInput}". Por favor, introduce una dirección más específica o coordenadas.`);
-    }
-
-    const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
-    
-    const cleanLine = (line: string, prefix: string) => line.replace(new RegExp(`^${prefix}:?\\s*`, 'i'), '').trim();
-    
-    let finalRecipient = rawInput;
-    let finalAddress = rawInput;
-
-    lines.forEach(line => {
-      if (line.toUpperCase().startsWith('NOMBRE')) finalRecipient = cleanLine(line, 'NOMBRE');
-      if (line.toUpperCase().startsWith('DIRECCION')) finalAddress = cleanLine(line, 'DIRECCION');
-    });
-
-    return {
-      recipient: title || finalRecipient,
-      address: finalAddress,
-      lat,
-      lng,
-      sourceUrl: url || `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`,
-      phone: text.match(/(?:\+34|34)?[6789]\d{8}/)?.[0]
-    };
-  }, onRetry);
-
-  addressCache[cacheKey] = result;
-  saveCache();
-  return result;
+    throw error;
+  }
 };
 
 // Simple route hash to avoid re-optimizing the exact same list
 let lastRouteHash = "";
 
-export const optimizeRoute = async (deliveries: Delivery[], start: string, onRetry?: (msg: string) => void) => {
+export const optimizeRoute = async (
+  deliveries: Delivery[],
+  start: string,
+  onRetry?: (msg: string) => void
+) => {
   const routeHash = JSON.stringify(deliveries.map(d => d.id).sort()) + start;
   if (routeHash === lastRouteHash && addressCache['last_route_order']) {
     return addressCache['last_route_order'];
   }
 
-  const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || "").trim();
-  if (!apiKey || apiKey === "undefined" || apiKey === "null" || apiKey.length < 10) {
-    throw new Error("Error de Configuración: La clave de API no es válida o está vacía.");
-  }
+  try {
+    const apiKey = (process.env.GEMINI_API_KEY || process.env.API_KEY || "").trim();
+    if (!apiKey || apiKey === "undefined" || apiKey === "null" || apiKey.length < 10) {
+      throw new Error("Error de Configuración: La clave de API no es válida o está vacía.");
+    }
 
-  const ai = new GoogleGenAI({ apiKey });
-  const result = await withRetry(async () => {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-flash',
-      contents: [{
-        role: "user",
-        parts: [{
-          text: `Ordena estos IDs para la ruta más corta empezando en ${start}: ${JSON.stringify(
-            deliveries.map(d => ({ id: d.id, a: d.address }))
-          )}.
+    const ai = new GoogleGenAI({ apiKey });
+    const result = await withRetry(async () => {
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.5-flash',
+        contents: [{
+          role: "user",
+          parts: [{
+            text: `Ordena estos IDs para la ruta más corta empezando en ${start}: ${JSON.stringify(
+              deliveries.map(d => ({ id: d.id, a: d.address }))
+            )}.
 Responde solo JSON: {"order": ["id1", "id2", ...]}`
-        }]
-      }],
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: { 
-            order: { 
-              type: Type.ARRAY, 
-              items: { type: Type.STRING } 
-            } 
-          },
-          required: ["order"]
+          }]
+        }],
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: { 
+              order: { 
+                type: Type.ARRAY, 
+                items: { type: Type.STRING } 
+              } 
+            },
+            required: ["order"]
+          }
         }
+      });
+      const text = response.text;
+      let data: any;
+      try {
+        data = JSON.parse(text);
+      } catch (jsonErr: unknown) {
+        console.error("Error parseando JSON en optimizeRoute:", text, jsonErr);
+        throw new Error("No se pudo interpretar la respuesta de optimización de ruta.");
       }
-    });
-    const data = JSON.parse(response.text);
-    return data.order as string[];
-  }, onRetry);
+      return data.order as string[];
+    }, onRetry);
 
-  lastRouteHash = routeHash;
-  addressCache['last_route_order'] = result;
-  return result;
+    lastRouteHash = routeHash;
+    addressCache['last_route_order'] = result;
+    return result;
+  } catch (error: unknown) {
+    const message = getErrorMessage(error);
+
+    try {
+      console.error("Error optimizeRoute (detallado):", JSON.stringify(error, null, 2));
+    } catch {
+      console.error("Error optimizeRoute (string):", String(error));
+    }
+
+    // Si quieres también podríamos usar debugAlert aquí, pero de momento
+    // nos centramos en el fallo principal de parseAddress.
+    alert(`❌ Error al optimizar la ruta:\n${message}\n\nInténtalo de nuevo o comprueba tu conexión.`);
+    throw error;
+  }
 };
+
+
