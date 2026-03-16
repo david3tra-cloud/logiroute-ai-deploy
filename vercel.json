@@ -1,9 +1,10 @@
 {
-  "builds": [
-    { "src": "vite.config.ts", "use": "@vercel/node" }
-  ],
-  "routes": [
-    { "src": "/manifest.json", "dest": "/public/manifest.json" },
-    { "src": "/sw.js", "dest": "/public/sw.js" }
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/manifest.json", "destination": "/public/manifest.json" },
+    { "source": "/sw.js", "destination": "/public/sw.js" },
+    { "source": "/(.*)", "destination": "/" }
   ]
 }
