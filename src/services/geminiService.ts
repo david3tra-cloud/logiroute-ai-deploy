@@ -31,7 +31,6 @@ function getErrorMessage(error: unknown): string {
 
 // DEBUG: mostrar el error en móvil de forma explícita
 function debugAlert(message: string) {
-  // Cuando acabemos de depurar, puedes comentar este alert
   alert(`DEBUG ERROR:\n${message}`);
 }
 
@@ -51,7 +50,6 @@ let addressCache: Record<string, any> = getInitialCache();
 
 const saveCache = () => {
   try {
-    // Keep cache size reasonable (max 100 entries)
     const keys = Object.keys(addressCache);
     if (keys.length > 100) {
       delete addressCache[keys[0]];
@@ -81,7 +79,6 @@ function expandSearchTerms(name: string, address: string = ''): string[] {
 
   let expanded = [combined];
 
-  // Detecta palabras clave y expande
   for (const [keyword, synonyms] of Object.entries(BUSINESS_SYNONYMS)) {
     if (combined.includes(keyword)) {
       synonyms.forEach(syn => {
@@ -137,21 +134,30 @@ async function withRetry<T>(
 /**
  * Extrae coordenadas de cualquier texto, URL o formato lat,lng.
  * Devuelve siempre { lat, lng } con lat en [-90,90] y lng en [-180,180].
+ * Detecta y corrige el caso [lng, lat] → [lat, lng].
  */
 const extractCoords = (text: string) => {
   if (!text) return null;
   
-  // Normalizar comas decimales y limpiar texto
   let normalized = text.trim().replace(/(\d),(\d)/g, '$1.$2');
 
-  // 1. Patrón específico COORDENADAS: lat, lng
-  const coordsPrefixPattern = /COORDENADAS[:\s]*([-+]?\d+\.?\d*)\s*[,; \t]\s*([-+]?\d+\.?\d*)/i;
+  const fixOrder = (a: number, b: number) => {
+    const aIsLat = a >= -90 && a <= 90;
+    const bIsLat = b >= -90 && b <= 90;
+    if (aIsLat && !bIsLat) return { lat: a, lng: b };
+    if (!aIsLat && bIsLat) return { lat: b, lng: a };
+    return { lat: a, lng: b };
+  };
+
+  // 1. Patrón específico COORDENADAS: a, b
+  const coordsPrefixPattern = /COORDENADAS[:\s]*([-+]?\d+\.?\d*)\s*[,;\s]\s*([-+]?\d+\.?\d*)/i;
   const prefixMatch = normalized.match(coordsPrefixPattern);
   if (prefixMatch) {
-    const lng = parseFloat(prefixMatch[1]);
-    const lat = parseFloat(prefixMatch[2]);
-    if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
-      return { lat, lng };
+    const a = parseFloat(prefixMatch[1]);
+    const b = parseFloat(prefixMatch[2]);
+    if (!isNaN(a) && !isNaN(b)) {
+      const { lat, lng } = fixOrder(a, b);
+      if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng };
     }
   }
 
@@ -167,10 +173,11 @@ const extractCoords = (text: string) => {
   for (const pattern of urlPatterns) {
     const urlMatch = normalized.match(pattern);
     if (urlMatch) {
-      const lat = parseFloat(urlMatch[1]);
-      const lng = parseFloat(urlMatch[2]);
-      if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
-        return { lat, lng };
+      const a = parseFloat(urlMatch[1]);
+      const b = parseFloat(urlMatch[2]);
+      if (!isNaN(a) && !isNaN(b)) {
+        const { lat, lng } = fixOrder(a, b);
+        if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng };
       }
     }
   }
@@ -190,16 +197,17 @@ const extractCoords = (text: string) => {
     }
   }
 
-  // 4. Patrón simple lat,lng restringido a España
-  const simplePattern = /([-+]?\d+\.?\d*)\s*[,; \t]\s*([-+]?\d+\.?\d*)/;
+  // 4. Patrón simple a,b restringido a España (después de corregir orden)
+  const simplePattern = /([-+]?\d+\.?\d*)\s*[,;\s]\s*([-+]?\d+\.?\d*)/;
   const match = normalized.match(simplePattern);
   
   if (match) {
-    const lat = parseFloat(match[1]);
-    const lng = parseFloat(match[2]);
-    const isSpain = lat > 35 && lat < 44 && lng > -10 && lng < 5;
-    if (!isNaN(lat) && !isNaN(lng) && isSpain) {
-      return { lat, lng };
+    const a = parseFloat(match[1]);
+    const b = parseFloat(match[2]);
+    if (!isNaN(a) && !isNaN(b)) {
+      const { lat, lng } = fixOrder(a, b);
+      const isSpain = lat > 35 && lat < 44 && lng > -10 && lng < 5;
+      if (isSpain) return { lat, lng };
     }
   }
   
@@ -236,12 +244,10 @@ export const parseAddress = async (
   const cacheKey = `${rawInput}|${rawManual}`.toLowerCase();
   
   try {
-    // 1. Check persistent cache first
     if (addressCache[cacheKey]) {
       return addressCache[cacheKey];
     }
 
-    // 2. Local check for coordinates (No API call needed)
     const directCoords = extractCoords(rawManual || rawInput);
     if (directCoords && !isPlusCode(rawManual || rawInput)) {
       const isCoordinateOnly = !rawInput || extractCoords(rawInput);
@@ -283,7 +289,6 @@ export const parseAddress = async (
 
       let response: any;
       try {
-        // Usamos gemini-2.5-flash con googleMaps para máxima precisión en lugares
         response = await ai.models.generateContent({
           model: "gemini-2.5-flash",
           contents: [{ role: "user", parts: [{ text: prompt }] }],
@@ -313,7 +318,6 @@ export const parseAddress = async (
           });
         } catch (fallbackErr: unknown) {
           console.warn("Error en búsqueda principal:", fallbackErr);
-          // Fallback simplificado si falla todo lo anterior
           response = await ai.models.generateContent({
             model: "gemini-3.5-flash",
             contents: [{
@@ -375,7 +379,6 @@ Responde solo JSON con este esquema:
       let title = "";
       let url = "";
 
-      // 1. Intentar extraer de los metadatos de búsqueda (Grounding)
       if (chunks && chunks.length > 0) {
         for (const c of chunks) {
           if (c.web?.uri) {
@@ -391,7 +394,6 @@ Responde solo JSON con este esquema:
         }
       }
 
-      // 2. Si no hay en metadatos, extraer del texto de la respuesta
       if (lat === null || lng === null) {
         const coordsFromText = extractCoords(text);
         if (coordsFromText) {
@@ -400,7 +402,6 @@ Responde solo JSON con este esquema:
         }
       }
 
-      // 3. Extraer URL del texto si no la tenemos
       if (!url) {
         const urlMatch = text.match(/https?:\/\/(?:www\.)?(?:google\.com\/maps|maps\.app\.goo\.gl)\/[^\s]+/i);
         if (urlMatch) url = urlMatch[0];
@@ -450,13 +451,7 @@ Responde solo JSON con este esquema:
       console.error("Error parseAddress (string):", String(error));
     }
 
-    // DEBUG: ver error en móvil
     debugAlert(message);
-
-    // Si quieres mantener el mensaje "bonito", puedes dejar también este alert,
-    // o comentarlo mientras estamos depurando.
-    // alert(`❌ Error al buscar la dirección:\n${message}\n\nInténtalo de nuevo o comprueba tu conexión.`);
-
     throw error;
   }
 };
@@ -530,11 +525,7 @@ Responde solo JSON: {"order": ["id1", "id2", ...]}`
       console.error("Error optimizeRoute (string):", String(error));
     }
 
-    // Si quieres también podríamos usar debugAlert aquí, pero de momento
-    // nos centramos en el fallo principal de parseAddress.
     alert(`❌ Error al optimizar la ruta:\n${message}\n\nInténtalo de nuevo o comprueba tu conexión.`);
     throw error;
   }
 };
-
-

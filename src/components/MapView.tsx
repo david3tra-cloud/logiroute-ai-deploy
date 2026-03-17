@@ -11,10 +11,15 @@ interface MapViewProps {
 }
 
 const MapView: React.FC<MapViewProps> = ({ deliveries, manualSequence, selectedId, onMarkerClick, viewMode }) => {
+  // Exponer las entregas en window para poder ver qué coordinates llegan realmente
+  if (typeof window !== 'undefined') {
+    // @ts-ignore
+    window.__DELIVERIES__ = deliveries;
+  }
+
   const mapRef = useRef<L.Map | null>(null);
   const markersRef = useRef<{ [key: string]: L.Marker }>({});
   const polylineRef = useRef<L.Polyline | null>(null);
-  const pressTimerRef = useRef<number | null>(null);
 
   const isValidLatLng = (coords: any): coords is [number, number] => {
     return Array.isArray(coords) && 
@@ -27,14 +32,18 @@ const MapView: React.FC<MapViewProps> = ({ deliveries, manualSequence, selectedI
            isFinite(coords[1]);
   };
 
-  // Normaliza coordenadas a [lat, lng] aunque vengan como objeto o [lng, lat]
+  // Normaliza coordenadas a [lat, lng], aunque vengan como objeto, strings o [lng, lat]
   const normalizeCoords = (coords: any): [number, number] | null => {
     if (!coords) return null;
 
-    // Caso array [a, b]
+    // Caso array [a, b] o ["a","b"]
     if (Array.isArray(coords) && coords.length === 2) {
-      const [a, b] = coords;
-      if (typeof a === 'number' && typeof b === 'number') {
+      let [a, b] = coords as any[];
+
+      a = typeof a === 'string' ? parseFloat(a) : a;
+      b = typeof b === 'string' ? parseFloat(b) : b;
+
+      if (typeof a === 'number' && typeof b === 'number' && !isNaN(a) && !isNaN(b)) {
         const looksLikeLatFirst = a <= 90 && a >= -90;
         const looksLikeLatSecond = b <= 90 && b >= -90;
 
@@ -47,11 +56,15 @@ const MapView: React.FC<MapViewProps> = ({ deliveries, manualSequence, selectedI
       }
     }
 
-    // Caso objeto { lat, lng } o { latitude, longitude }
+    // Caso objeto { lat, lng } o { latitude, longitude } (posible string)
     if (typeof coords === 'object') {
-      const lat = coords.lat ?? coords.latitude;
-      const lng = coords.lng ?? coords.longitude;
-      if (typeof lat === 'number' && typeof lng === 'number') {
+      let lat = (coords as any).lat ?? (coords as any).latitude;
+      let lng = (coords as any).lng ?? (coords as any).longitude;
+
+      if (typeof lat === 'string') lat = parseFloat(lat);
+      if (typeof lng === 'string') lng = parseFloat(lng);
+
+      if (typeof lat === 'number' && typeof lng === 'number' && !isNaN(lat) && !isNaN(lng)) {
         return [lat, lng];
       }
     }

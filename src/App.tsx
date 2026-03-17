@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect, useRef } from 'react';
 import { Plus, Map as MapIcon, List, BrainCircuit, Loader2, X, Navigation, LayoutGrid, LogOut, CheckCircle2, ArrowDownLeft, ArrowUpRight, Clock, AlertTriangle, Truck, Phone, RotateCcw, Settings2, BarChart3, Package, Archive, Mic, MapPin, Power, RefreshCcw, User, Tag } from 'lucide-react';
 import MapView from './components/MapView';
@@ -125,6 +124,12 @@ const App: React.FC = () => {
 
     try {
       const parsed = await parseAddress(search, currentUserLoc, coords, (msg) => setParsingMessage(msg));
+
+      // Normalizamos lat/lng a números y en el orden [lat, lng]
+      const rawLat = (parsed as any).lat;
+      const rawLng = (parsed as any).lng;
+      const lat = typeof rawLat === 'string' ? parseFloat(rawLat) : rawLat;
+      const lng = typeof rawLng === 'string' ? parseFloat(rawLng) : rawLng;
       
       const newDelivery: Delivery = {
         id: Math.random().toString(36).substring(2, 9),
@@ -132,7 +137,7 @@ const App: React.FC = () => {
         recipient: parsed.recipient || search,
         address: parsed.address,
         phone: newPhoneInput.trim() || parsed.phone || '',
-        coordinates: [parsed.lat, parsed.lng],
+        coordinates: [lat, lng],
         status: DeliveryStatus.PENDING,
         type: newType,
         sourceUrl: parsed.sourceUrl,
@@ -267,7 +272,6 @@ const App: React.FC = () => {
                     onClick={async () => {
                       if (window.confirm("¿REPARAR APLICACIÓN? Esto forzará una limpieza profunda de la memoria y reiniciará la app.")) {
                         try {
-                          // Clear all caches
                           if ('serviceWorker' in navigator) {
                             const registrations = await navigator.serviceWorker.getRegistrations();
                             for(let registration of registrations) {
@@ -280,11 +284,8 @@ const App: React.FC = () => {
                               await caches.delete(name);
                             }
                           }
-                          // Clear storage
                           localStorage.clear();
                           sessionStorage.clear();
-                          
-                          // Hard reload with cache busting
                           const cleanUrl = window.location.origin + window.location.pathname + '?v=' + Date.now();
                           window.location.replace(cleanUrl);
                         } catch (err) {
